@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import random
+import time
+from collections import deque
 from typing import List, Optional, Union
 
 import json5
@@ -83,6 +86,12 @@ class CortexRuntime:
         self.cortex_loop_task: Optional[asyncio.Task] = None
 
         self._is_reloading = False
+        # Rate limiting: 120 requests per 5 minutes, minimum 1.5s interval, random delay
+        self._api_call_times: deque = deque()  # Track API call timestamps in the last 5 minutes
+        self._max_requests_per_window: int = 120
+        self._min_interval: float = 1.5  # Minimum 1.5 seconds between calls
+        self._max_interval: float = 3.5  # Maximum interval for random delay (can be adjusted)
+        self._window_duration: float = 300.0  # 5 minutes window
 
         if self.hot_reload:
             self.config_path = self._create_runtime_config_file()
@@ -500,6 +509,43 @@ class CortexRuntime:
                 logging.debug("No prompt to fuse")
                 return
 
+            # Rate limiting: 120 requests per 5 minutes, minimum 1.5s interval, random delay
+            current_time = time.time()
+            
+            # Clean up old timestamps outside the 5-minute window
+            while self._api_call_times and current_time - self._api_call_times[0] > self._window_duration:
+                self._api_call_times.popleft()
+            
+            # Check if we've reached the limit for this 5-minute window
+            if len(self._api_call_times) >= self._max_requests_per_window:
+                # Calculate wait time until the oldest request falls out of the window
+                oldest_call_time = self._api_call_times[0]
+                wait_time = self._window_duration - (current_time - oldest_call_time) + 0.1  # Add small buffer
+                logging.info(f"Rate limit reached ({self._max_requests_per_window} requests/5min). Waiting {wait_time:.2f}s")
+                await asyncio.sleep(wait_time)
+                current_time = time.time()
+                # Clean up again after waiting
+                while self._api_call_times and current_time - self._api_call_times[0] > self._window_duration:
+                    self._api_call_times.popleft()
+            
+            # Ensure minimum interval since last call
+            if self._api_call_times:
+                time_since_last_call = current_time - self._api_call_times[-1]
+                if time_since_last_call < self._min_interval:
+                    wait_time = self._min_interval - time_since_last_call
+                    logging.debug(f"Minimum interval not met. Waiting {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+                    current_time = time.time()
+            
+            # Random delay between min_interval and max_interval
+            random_delay = random.uniform(self._min_interval, self._max_interval)
+            logging.debug(f"Random delay: {random_delay:.2f}s before API call")
+            await asyncio.sleep(random_delay)
+            
+            # Record this API call time
+            current_time = time.time()
+            self._api_call_times.append(current_time)
+            
             # if there is a prompt, send to the AIs
             output = await self.config.cortex_llm.ask(prompt)
             if output is None:
